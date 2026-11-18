@@ -350,9 +350,18 @@ def _compress_texture(texconv_path, image, texture):
             "-f", output_format,
             "-o", output_dir,
         ]
+        texconv_input = source_path
         if texture.vk_format == 146:
             command.append("-srgb")
-        command.append(str(source_path))
+        elif source_path.suffix.lower() == ".png":
+            # Linear target (material/normal map): drop the PNG's sRGB/gAMA tags,
+            # otherwise texconv converts the data sRGB -> linear and darkens it.
+            from .core.texture_prep import strip_png_color_space
+            linear_dir = Path(output_dir) / "linear_source"
+            linear_dir.mkdir()
+            texconv_input = linear_dir / source_path.name
+            texconv_input.write_bytes(strip_png_color_space(source_path.read_bytes()))
+        command.append(str(texconv_input))
         result = subprocess.run(
             command,
             capture_output=True,
