@@ -1213,10 +1213,15 @@ def _move_into_place(staging: Path, target: Path, attempts: int = 10, delay: flo
     for attempt in range(attempts):
         try:
             staging.replace(target)
+            if attempt:
+                print(f"[Enshrouded Tools] {target.name}: folder rename succeeded after {attempt} retr"
+                      f"{'y' if attempt == 1 else 'ies'} (folder was locked, e.g. by Dropbox)")
             return
-        except PermissionError:
+        except PermissionError as exc:
+            print(f"[Enshrouded Tools] {target.name}: folder rename attempt {attempt + 1}/{attempts} locked: {exc}")
             if attempt + 1 < attempts:
                 time.sleep(delay)
+    print(f"[Enshrouded Tools] {target.name}: still locked, copying files into place instead")
     shutil.copytree(staging, target)
     shutil.rmtree(staging, ignore_errors=True)
 
