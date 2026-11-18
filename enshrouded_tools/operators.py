@@ -841,13 +841,12 @@ class ENSHROUDED_OT_import_model(Operator):
                 resource_index = lookup.resource_index
                 descriptor = reader.read_resource(resource_index)
                 model = parse_render_model(descriptor, archive_format=reader.format)
-                if reader.format == 'KFC4' and props.import_weights:
-                    self.report({'WARNING'}, 'KFC4 import: vertex weights are not migrated yet')
                 content_index, render_data = reader.read_content(model.render_data_hash)
                 skinning = None
-                if props.import_weights and reader.format == 'KFC3':
+                if props.import_weights:
                     try:
-                        skinning = read_skinning(reader, descriptor, model, render_data)
+                        skinning = read_skinning(reader, descriptor, model, render_data,
+                                                 archive_format=reader.format)
                     except (ValueError, KeyError, struct.error) as exc:
                         self.report({'WARNING'}, f'Vertex weights skipped: {exc}')
                 blender_materials = []
