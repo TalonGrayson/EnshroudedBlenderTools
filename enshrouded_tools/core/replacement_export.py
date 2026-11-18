@@ -1202,6 +1202,25 @@ def make_validation_json(
     ) + "\n"
 
 
+def _move_into_place(staging: Path, target: Path, attempts: int = 10, delay: float = 0.3) -> None:
+    """Rename the staged mod folder to its final name.
+
+    Sync tools (Dropbox, OneDrive) and virus scanners briefly lock freshly
+    written folders, which makes the rename fail with WinError 32. Retry for a
+    few seconds, then fall back to copying the files over.
+    """
+    import time
+    for attempt in range(attempts):
+        try:
+            staging.replace(target)
+            return
+        except PermissionError:
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+    shutil.copytree(staging, target)
+    shutil.rmtree(staging, ignore_errors=True)
+
+
 def write_replacement_mod(
     mods_root,
     mod_id: str,
@@ -1292,7 +1311,7 @@ def write_replacement_mod(
                 shutil.rmtree(target)
             else:
                 target.unlink()
-        staging.replace(target)
+        _move_into_place(staging, target)
         staging = None
         return target
     finally:

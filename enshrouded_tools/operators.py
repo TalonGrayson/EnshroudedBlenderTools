@@ -1502,12 +1502,15 @@ class ENSHROUDED_OT_export_replacement(Operator):
             name not in ('root',) and name.startswith(('j_', 'joint_'))
             for influences in skin_influences for name, _weight in influences
         )
-        if not has_joint_groups and not fallback_name:
-            return None
         guid = skeleton_guid(descriptor, reader.format)
         if guid is None:
-            self.report({'WARNING'}, 'Target RenderModel is static; bone weights were not exported')
+            if has_joint_groups or fallback_name:
+                self.report({'WARNING'}, 'Target RenderModel is static; bone weights were not exported')
             return None
+        if not has_joint_groups and not fallback_name:
+            # A static mesh on a skinned target floats in place; make that a deliberate choice.
+            raise ValueError('Target is a skinned model but the mesh has no bone weights: add vertex groups '
+                             'named after joints, set "Unweighted To Bone", or turn off "Export Bone Weights"')
         if reader.format != 'KFC4':
             raise ValueError('Skinned export is only supported for KFC4 archives')
         hashes = hierarchy_hashes(reader, guid)
