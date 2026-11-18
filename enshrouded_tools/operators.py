@@ -46,6 +46,30 @@ def _prefs(context):
     return context.preferences.addons[__package__].preferences
 
 
+def _clean_archive_pair(kfc, resources):
+    """Prefer the unmodified game archives when a mod loader keeps backups.
+
+    ShroudForge bakes enabled mods into the live enshrouded.kfc* at every launch
+    and leaves them modified; it keeps the originals as *.bak and restores them
+    before the next bake. Reading the live files then picks up our own previous
+    mod (e.g. a cloned material GUID that will not exist next launch). Use the
+    backups unless they are from a different game build (Steam update since).
+    """
+    kfc_backup = kfc.with_name(kfc.name + ".bak")
+    resources_backup = resources.with_name(resources.name + ".bak")
+    if not (kfc_backup.is_file() and resources_backup.is_file()):
+        return kfc, resources
+    try:
+        same_build = (KFC3Reader.read_version_string(kfc_backup)
+                      == KFC3Reader.read_version_string(kfc))
+    except (OSError, ValueError, EOFError, struct.error):
+        same_build = False
+    if not same_build:
+        print("[Enshrouded Tools] enshrouded.kfc.bak is from another game build; reading the live archive")
+        return kfc, resources
+    return kfc_backup, resources_backup
+
+
 def _archive_paths(context):
     selected_path = Path(bpy.path.abspath(_prefs(context).game_path))
     candidates = (selected_path, *selected_path.parents)
@@ -54,7 +78,7 @@ def _archive_paths(context):
         resources = game_path / "enshrouded.kfc_resources"
         executable = game_path / "enshrouded.exe"
         if executable.is_file() and kfc.is_file() and resources.is_file():
-            return kfc, resources
+            return _clean_archive_pair(kfc, resources)
 
     # Keep the error paths rooted at the selected directory. No recursive file
     # search is used, so Mods and other subdirectories can never become sources.

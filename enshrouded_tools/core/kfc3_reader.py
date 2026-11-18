@@ -17,6 +17,17 @@ KFC3_MAGIC = b"KFC3"
 KFC4_MAGIC = b"KFC4"
 
 
+def archive_base_name(kfc_path) -> str:
+    """'enshrouded' for enshrouded.kfc and for a backup copy such as enshrouded.kfc.bak.
+
+    DAT containers are always named after the live archive (enshrouded_NNN.dat).
+    """
+    name = Path(kfc_path).name
+    if name.lower().endswith(".bak"):
+        name = name[:-4]
+    return Path(name).stem
+
+
 @dataclass(frozen=True)
 class KFCLocation:
     offset: int
@@ -169,6 +180,17 @@ class KFC3Reader:
         if len(data) != 4:
             raise EOFError("unexpected EOF while reading u32")
         return struct.unpack("<I", data)[0]
+
+    @staticmethod
+    def read_version_string(kfc_path: os.PathLike | str) -> str:
+        """Archive build/version string, read from the header without parsing the tables."""
+        with Path(kfc_path).open("rb") as f:
+            if f.read(4) not in (KFC3_MAGIC, KFC4_MAGIC):
+                raise ValueError(f"not a KFC archive: {kfc_path}")
+            f.seek(16)
+            location = KFC3Reader._read_location(f)
+            f.seek(location.offset)
+            return f.read(location.count).decode("utf-8", errors="replace")
 
     @staticmethod
     def _read_location(f: BinaryIO) -> KFCLocation:
@@ -403,7 +425,7 @@ class KFC3Reader:
         entry = self.content_entries[index]
         size = struct.unpack_from("<I", content_hash, 0)[0]
         dat_path = self.kfc_path.with_name(
-            f"{self.kfc_path.stem}_{entry.container_index:03d}.dat"
+            f"{archive_base_name(self.kfc_path)}_{entry.container_index:03d}.dat"
         )
         with dat_path.open("rb") as dat_file:
             if entry.offset + size > os.fstat(dat_file.fileno()).st_size:
