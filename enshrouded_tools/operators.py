@@ -570,7 +570,8 @@ def _collect_effect_patches(collection, source_to_blender):
     return tuple(_effect_patch_from_object(obj, source_to_blender) for obj in objects)
 
 
-def _full_topology_records(export_mesh, object_to_source):
+def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
+    """``source_vertices``, if given, receives the mesh vertex index of each record."""
     export_mesh.calc_loop_triangles()
     uv_layer = export_mesh.uv_layers.active
     has_tangents = False
@@ -611,6 +612,8 @@ def _full_topology_records(export_mesh, object_to_source):
                 else:
                     game_uv = (0.0, 0.0)
                 triangle_indices.append(len(records))
+                if source_vertices is not None:
+                    source_vertices.append(loop.vertex_index)
                 records.append(
                     (
                         tuple(position),
@@ -1285,21 +1288,40 @@ class ENSHROUDED_OT_select_material_texture(Operator, ImportHelper):
         return {"FINISHED"}
 
 
-def _object_export_records(context, obj, export_mode):
+def _vertex_group_influences(obj, mesh, source_vertices):
+    """Per exported record: ((vertex group name, weight), ...) with non-zero weights."""
+    names = {group.index: group.name for group in obj.vertex_groups}
+    per_vertex = {}
+    result = []
+    for vertex_index in source_vertices:
+        influences = per_vertex.get(vertex_index)
+        if influences is None:
+            influences = tuple((names[g.group], g.weight)
+                               for g in mesh.vertices[vertex_index].groups
+                               if g.weight > 0.0 and g.group in names)
+            per_vertex[vertex_index] = influences
+        result.append(influences)
+    return result
+
+
+def _object_export_records(context, obj, export_mode, influences_out=None):
     depsgraph = context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
     try:
         transform = _source_to_blender_matrix().inverted() @ evaluated.matrix_world
         if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
-            records, indices, ranges = _full_topology_records(mesh, transform)
+            sources = [] if influences_out is not None else None
+            records, indices, ranges = _full_topology_records(mesh, transform, sources)
+            if influences_out is not None:
+                influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
             return None, records, indices, ranges
         return tuple(tuple(transform @ v.co) for v in mesh.vertices), None, None, None
     finally:
         evaluated.to_mesh_clear()
 
 
-def _collection_export_records(context, collection):
+def _collection_export_records(context, collection, influences_out=None):
     from types import SimpleNamespace
     records, buckets, materials = [], {}, []
     depsgraph = context.evaluated_depsgraph_get()
@@ -1313,7 +1335,10 @@ def _collection_export_records(context, collection):
         evaluated = obj.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
-            vertices, indices, ranges = _full_topology_records(mesh, transform @ evaluated.matrix_world)
+            sources = [] if influences_out is not None else None
+            vertices, indices, ranges = _full_topology_records(mesh, transform @ evaluated.matrix_world, sources)
+            if influences_out is not None:
+                influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
             base = len(records)
             records.extend(vertices)
             for local_slot, start, count in ranges:
@@ -1440,16 +1465,21 @@ class ENSHROUDED_OT_export_replacement(Operator):
             return {"CANCELLED"}
 
         texture_source = obj
+        skin_influences = (
+            [] if export_mode == "FULL_REPLACEMENT" and props.export_skin_weights else None
+        )
         if collection is not None:
             try:
-                vertex_records, indices, material_mesh_ranges, texture_source = _collection_export_records(context, collection)
+                vertex_records, indices, material_mesh_ranges, texture_source = _collection_export_records(
+                    context, collection, skin_influences)
                 positions = None
             except Exception as exc:
                 self.report({"ERROR"}, f"Collection export failed: {exc}")
                 return {"CANCELLED"}
         else:
             try:
-                positions, vertex_records, indices, material_mesh_ranges = _object_export_records(context, obj, export_mode)
+                positions, vertex_records, indices, material_mesh_ranges = _object_export_records(
+                    context, obj, export_mode, skin_influences)
             except Exception as exc:
                 self.report({"ERROR"}, f"Mesh export failed: {exc}")
                 return {"CANCELLED"}
@@ -1457,14 +1487,52 @@ class ENSHROUDED_OT_export_replacement(Operator):
         try:
             return self._write_export(context, props, obj, export_mode, source_guid, target_guid,
                 kfc, resources, collider_groups, texture_source, positions, vertex_records,
-                indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches)
+                indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches,
+                skin_influences)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
+    def _skinning_stream(self, props, reader, descriptor, skin_influences):
+        """Resolve vertex groups against the target skeleton; None = static export."""
+        from .core.skin_export import encode_skinning, resolve_joint
+        from .core.skinning import hierarchy_hashes, skeleton_guid
+        fallback_name = props.skin_fallback_bone.strip()
+        has_joint_groups = any(
+            name not in ('root',) and name.startswith(('j_', 'joint_'))
+            for influences in skin_influences for name, _weight in influences
+        )
+        if not has_joint_groups and not fallback_name:
+            return None
+        guid = skeleton_guid(descriptor, reader.format)
+        if guid is None:
+            self.report({'WARNING'}, 'Target RenderModel is static; bone weights were not exported')
+            return None
+        if reader.format != 'KFC4':
+            raise ValueError('Skinned export is only supported for KFC4 archives')
+        hashes = hierarchy_hashes(reader, guid)
+        cache = {}
+
+        def joint(name):
+            if name not in cache:
+                cache[name] = resolve_joint(name, hashes)
+            return cache[name]
+
+        fallback = None
+        if fallback_name:
+            fallback = joint(fallback_name)
+            if fallback is None:
+                raise ValueError(f'"Unweighted To Bone" is not a joint name: {fallback_name}')
+        resolved = [
+            [(joint(name), weight) for name, weight in influences if joint(name) is not None]
+            for influences in skin_influences
+        ]
+        return encode_skinning(resolved, fallback)
+
     def _write_export(self, context, props, obj, export_mode, source_guid, target_guid,
                       kfc, resources, collider_groups, texture_source, positions, vertex_records,
-                      indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches):
+                      indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches,
+                      skin_influences=None):
 
         try:
             with KFC3Reader(kfc, resources) as reader:
@@ -1509,15 +1577,19 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 if lookup is None:
                     raise ValueError(f"target RenderModel not found: {target_guid}")
                 archive_format = reader.format
-                model = parse_render_model(reader.read_resource(lookup.resource_index), archive_format=reader.format)
+                descriptor = reader.read_resource(lookup.resource_index)
+                model = parse_render_model(descriptor, archive_format=reader.format)
                 _content_index, original_data = reader.read_content(model.render_data_hash)
+                skinning = (self._skinning_stream(props, reader, descriptor, skin_influences)
+                            if skin_influences is not None else None)
                 texture_patches = (
                     _collect_texture_patches(texture_source, reader, model, _prefs(context))
                     if props.export_textures else ()
                 )
             if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
                 replacement = build_full_topology_payload(
-                    vertex_records, indices, material_mesh_ranges, archive_format=archive_format
+                    vertex_records, indices, material_mesh_ranges, archive_format=archive_format,
+                    skinning=skinning,
                 )
                 if len(replacement.material_mesh_ranges) > len(model.meshes):
                     raise ValueError(

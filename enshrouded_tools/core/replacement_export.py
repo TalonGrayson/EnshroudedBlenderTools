@@ -32,6 +32,13 @@ class ReplacementPayload:
     full_topology: bool = False
     material_mesh_ranges: tuple[tuple[int, int, int], ...] = ()
     archive_format: str = 'KFC3'
+    # Skinned export (KFC4): stream sits between vertexData and indexData.
+    skinning_data_size: int = 0
+    skinning_map: tuple[int, ...] = ()
+
+    @property
+    def skinned(self) -> bool:
+        return self.skinning_data_size > 0
 
     @property
     def sha256(self) -> str:
@@ -144,11 +151,14 @@ def build_replacement_payload(model, original_data: bytes, positions) -> Replace
     )
 
 
-def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=(), *, archive_format='KFC3') -> ReplacementPayload:
-    """Build a complete static 24-byte vertex stream plus uint16 index stream.
+def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=(), *, archive_format='KFC3',
+                                skinning=None) -> ReplacementPayload:
+    """Build a complete 24-byte vertex stream plus uint16 index stream.
 
     Each record is ``(position, normal, tangent, bitangent_sign, uv, color)``.
     UV is already in Keen convention and color is four raw RGBA bytes.
+    ``skinning`` is an optional ``skin_export.SkinningStream`` (KFC4 only),
+    written between the vertex and index data like vanilla skinned models.
     """
     records = tuple(vertex_records)
     indices = tuple(int(index) for index in indices)
@@ -197,17 +207,24 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         vertices += struct.pack("<2e", float(uv[0]), float(uv[1]))
 
     index_data = struct.pack(f"<{len(indices)}H", *indices)
+    skin_data = b''
+    if skinning is not None:
+        if archive_format != 'KFC4':
+            raise ValueError('Skinned export is only supported for KFC4 archives')
+        if len(skinning.data) != len(records) * 8:
+            raise ValueError('skinning stream does not match the exported vertex count')
+        skin_data = skinning.data
     if archive_format == 'KFC4':
         vertices = b''.join(vertices[i*24+offset:i*24+offset+size]
                             for offset, size in ((0,8),(8,4),(12,4),(16,4),(20,4))
                             for i in range(len(records)))
-        index_data += bytes((-(len(vertices) + len(index_data))) % 16)
+        index_data += bytes((-(len(vertices) + len(skin_data) + len(index_data))) % 16)
     elif archive_format != 'KFC3':
         raise ValueError('Unsupported export archive format')
     center = tuple((raw_min[axis] + raw_max[axis]) * 0.5 for axis in range(3))
     radius = max(math.dist(position, center) for position in positions) + max(margins)
     return ReplacementPayload(
-        data=bytes(vertices) + index_data,
+        data=bytes(vertices) + skin_data + index_data,
         position_offset=position_offset,
         position_scale=position_scale,
         bounds_min=tuple(raw_min[axis] - margins[axis] for axis in range(3)),
@@ -221,6 +238,8 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         full_topology=True,
         material_mesh_ranges=material_mesh_ranges,
         archive_format=archive_format,
+        skinning_data_size=len(skin_data),
+        skinning_map=tuple(skinning.skinning_map) if skinning is not None else (),
     )
 
 
@@ -1140,6 +1159,8 @@ def make_validation_json(
             "index_count": replacement.index_count,
             "full_topology": replacement.full_topology,
             "vertex_data_size": replacement.vertex_data_size,
+            "skinning_data_size": replacement.skinning_data_size,
+            "skinning_map": replacement.skinning_map,
             "vertex_stride": replacement.vertex_stride,
             "material_mesh_ranges": replacement.material_mesh_ranges,
             "positionOffset": replacement.position_offset,

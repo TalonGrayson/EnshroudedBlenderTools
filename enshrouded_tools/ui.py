@@ -323,6 +323,10 @@ def _draw_export(layout, context, props, mode):
         layout.label(text="Model Replacement", icon="CON_ROTLIKE")
         layout.prop(props, "replacement_mode")
         layout.prop(props, "export_target_guid")
+        if props.replacement_mode == "FULL_REPLACEMENT":
+            layout.prop(props, "export_skin_weights")
+            if props.export_skin_weights:
+                layout.prop(props, "skin_fallback_bone")
     is_simple = mode == 'NEW_MODEL' and props.base_asset_type == 'PLACEABLE' and props.placeable_workflow == 'SIMPLE'
     collider_row = layout.row()
     collider_row.enabled = not is_simple

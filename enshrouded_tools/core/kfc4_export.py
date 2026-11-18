@@ -29,17 +29,29 @@ local exported_meshes = {{}}
  table.insert(exported_meshes, mesh)
 end
 ''')
+    skin_size = getattr(payload, 'skinning_data_size', 0)
+    if skin_size:
+        palette = ', '.join(str(joint) for joint in payload.skinning_map)
+        skin_lines = f'''if model.hierarchyJointCount == 0 then
+ error("[{mod_id}] skinned export needs a skinned target RenderModel (target has no skeleton)")
+end
+model.skinningData.start = {payload.vertex_data_size}
+model.skinningData.count = {skin_size}
+model.skinningMap = {{{palette}}}
+model.jointCount = {len(payload.skinning_map)}'''
+    else:
+        skin_lines = '''model.skinningData.start = 0
+model.skinningData.count = 0'''
     lines.append(f'''model.meshes = exported_meshes
 model.meshlets = {{}}
 model.hasCardClusterLod = false
 model.vertexData.start = 0
 model.vertexData.count = {payload.vertex_data_size}
-model.indexData.start = {payload.vertex_data_size}
+model.indexData.start = {payload.vertex_data_size + skin_size}
 model.indexData.count = {payload.index_count*2}
 model.meshletData.start = 0
 model.meshletData.count = 0
-model.skinningData.start = 0
-model.skinningData.count = 0
+{skin_lines}
 model.blendShapeData.start = 0
 model.blendShapeData.count = 0
 model.blendShapes = {{}}

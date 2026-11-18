@@ -367,6 +367,22 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
         description="Compress external replacement images and patch existing material slots",
         default=False,
     )
+    export_skin_weights: BoolProperty(
+        name="Export Bone Weights",
+        description=(
+            "Full replacement onto a skinned model (e.g. armour): write vertex groups named after skeleton "
+            "joints (j_64c5c233 or joint_017_64c5c233) so the mesh follows the character"
+        ),
+        default=True,
+    )
+    skin_fallback_bone: StringProperty(
+        name="Unweighted To Bone",
+        description=(
+            "Joint that receives vertices without bone weights, e.g. j_64c5c233 (head). "
+            "Leave empty to require weights on every vertex"
+        ),
+        default="",
+    )
     placeable_filter: StringProperty(
         name="Search Placeable Base",
         default="",

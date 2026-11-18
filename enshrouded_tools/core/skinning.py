@@ -25,6 +25,22 @@ def joint_group_name(skeleton_index, joint_hash):
     return f'joint_{skeleton_index:03d}_{joint_hash:08x}'
 
 
+def skeleton_guid(descriptor, archive_format):
+    """Hierarchy GUID of a skinned RenderModel, or None for a static model."""
+    layout = LAYOUTS.get(archive_format)
+    if layout is None or len(descriptor) < layout.min_size:
+        return None
+    raw = bytes(descriptor[layout.skeleton:layout.skeleton + 16])
+    return None if not any(raw) else str(uuid.UUID(bytes_le=raw))
+
+
+def hierarchy_hashes(reader, guid):
+    """Joint name hashes of a ModelHierarchyResource, indexed by skeleton joint."""
+    hierarchy = reader.read_resource(reader.find_resource_index(guid, HIERARCHY_TYPE_HASH))
+    start, count = _relative_array(hierarchy, 16, 4)
+    return struct.unpack_from(f'<{count}I', hierarchy, start)
+
+
 def read_skinning(reader, descriptor, model, render_data, archive_format='KFC3'):
     try:
         layout = LAYOUTS[archive_format]
