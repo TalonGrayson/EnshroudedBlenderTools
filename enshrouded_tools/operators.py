@@ -571,7 +571,14 @@ def _collect_effect_patches(collection, source_to_blender):
 
 
 def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
-    """``source_vertices``, if given, receives the mesh vertex index of each record."""
+    """Build one exported vertex per distinct face corner.
+
+    Corners of the same mesh vertex with the same normal, tangent frame and UV
+    share a record (all material ranges index one vertex buffer), so a smooth
+    mesh exports about one vertex per Blender vertex instead of three per
+    triangle. ``source_vertices``, if given, receives the mesh vertex index of
+    each record.
+    """
     export_mesh.calc_loop_triangles()
     uv_layer = export_mesh.uv_layers.active
     has_tangents = False
@@ -587,6 +594,7 @@ def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
     handedness_flip = -1.0 if direction_matrix.determinant() < 0.0 else 1.0
     records = []
     indices = []
+    record_by_corner = {}
     triangles_by_material = {}
     for triangle in export_mesh.loop_triangles:
         material_index = export_mesh.polygons[triangle.polygon_index].material_index
@@ -611,6 +619,18 @@ def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
                     game_uv = (float(uv.x), 1.0 - float(uv.y))
                 else:
                     game_uv = (0.0, 0.0)
+                corner = (
+                    loop.vertex_index,
+                    tuple(round(value, 6) for value in normal),
+                    tuple(round(value, 6) for value in tangent),
+                    bitangent_sign,
+                    tuple(round(value, 7) for value in game_uv),
+                )
+                existing = record_by_corner.get(corner)
+                if existing is not None:
+                    triangle_indices.append(existing)
+                    continue
+                record_by_corner[corner] = len(records)
                 triangle_indices.append(len(records))
                 if source_vertices is not None:
                     source_vertices.append(loop.vertex_index)
