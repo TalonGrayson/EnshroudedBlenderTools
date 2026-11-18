@@ -1226,6 +1226,26 @@ def _move_into_place(staging: Path, target: Path, attempts: int = 10, delay: flo
     shutil.rmtree(staging, ignore_errors=True)
 
 
+# Files in an existing mod folder that this exporter does not generate but other
+# tools keep there: ShroudForge's per-mod switch (``"enabled"``), editor config,
+# and Mod Builder project data. They survive a re-export of the same mod.
+PRESERVED_MOD_ENTRIES = ("extended.mod.json", ".luarc.json", "project.json", "snapshots", "entries")
+
+
+def _carry_over_preserved(target: Path, staging: Path) -> list[str]:
+    kept = []
+    for name in PRESERVED_MOD_ENTRIES:
+        source, destination = target / name, staging / name
+        if not source.exists() or destination.exists():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        else:
+            shutil.copy2(source, destination)
+        kept.append(name)
+    return kept
+
+
 def write_replacement_mod(
     mods_root,
     mod_id: str,
@@ -1311,6 +1331,10 @@ def write_replacement_mod(
             encoding="utf-8",
         )
 
+        if target.is_dir():
+            kept = _carry_over_preserved(target, staging)
+            if kept:
+                print(f"[Enshrouded Tools] {mod_id}: kept {', '.join(kept)} from the previous install")
         if target.exists():
             if target.is_dir():
                 shutil.rmtree(target)
