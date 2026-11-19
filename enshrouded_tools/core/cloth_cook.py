@@ -185,7 +185,7 @@ def cook(render_positions, render_triangles, pinned_render_vertices, *, bend_str
                     seen.add(pair)
                     bending.append(pair)
 
-    shear_seen, shear_unique = set(), []
+    shear_seen, shear_unique = set(seen), []   # a pair that is already a bending constraint isn't added twice
     for pair in shear:
         if pair not in shear_seen and pair not in stretch_set:
             shear_seen.add(pair)
