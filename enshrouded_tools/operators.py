@@ -1,4 +1,5 @@
 from pathlib import Path
+import dataclasses
 import re
 import struct
 import subprocess
@@ -1590,6 +1591,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                       indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches,
                       skin_influences=None):
 
+        cloth_note = ""
         try:
             with KFC3Reader(kfc, resources) as reader:
                 for group in collider_groups:
@@ -1662,6 +1664,20 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     )
             else:
                 replacement = build_replacement_payload(model, original_data, positions)
+                if archive_format == 'KFC4':
+                    from .core.cloth_reshape import reshape_cloth
+                    from .core.cloth_lua import reshape_lua
+                    reshaped = reshape_cloth(descriptor, positions)
+                    if reshaped:
+                        replacement = dataclasses.replace(
+                            replacement, extra_lua=reshape_lua(reshaped, mod_id))
+                        cloth_note = (f"{len(reshaped)} cloth part(s) kept, cloth vertices moved up to "
+                                      f"{max(r.max_render_move for r in reshaped):.3f} m")
+            if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"} and archive_format == 'KFC4':
+                from .core.cloth import cloth_offset
+                if cloth_offset(descriptor):
+                    self.report({'WARNING'}, 'Target model has cloth; Full Replacement does not keep cloth '
+                                             'simulation yet (the cloth parts export as static mesh)')
             model_name = model.debug_name
         except Exception as exc:
             self.report({"ERROR"}, f"Replacement build failed: {exc}")
@@ -1780,6 +1796,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
             f"{len(texture_patches)} textures, "
             f"{len(effect_patches)} effect anchors, "
             f"{'custom icon, ' if item_icon_data else ''}"
+            f"{cloth_note + ', ' if cloth_note else ''}"
             f"{len(replacement.data)} bytes"
         )
         return {"FINISHED"}

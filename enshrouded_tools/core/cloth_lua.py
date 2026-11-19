@@ -41,6 +41,31 @@ def fabric_lua(cooked, target):
 end"""
 
 
+def _float3s(values):
+    return "{" + ",\n  ".join(
+        f"{{x = {_number(v[0])}, y = {_number(v[1])}, z = {_number(v[2])}}}" for v in values) + "}"
+
+
+def reshape_lua(reshaped, mod_id, model_var="model"):
+    """Statements writing cloth_reshape.ReshapedCloth results (moved positions, new lengths) into `model_var`."""
+    blocks = [f'''if {model_var}.cloth == nil or #{model_var}.cloth.meshes < {max(r.cloth_index for r in reshaped) + 1} then
+    error("[{mod_id}] target RenderModel has no matching cloth block")
+end''']
+    for r in reshaped:
+        target = f"{model_var}.cloth.meshes[{r.cloth_index + 1}].data"
+        blocks.append(f"""do
+ local resource = {target}
+ if #resource.renderPositions ~= {len(r.render_positions)} or resource.fabric.numParticles ~= {len(r.simulation_positions)} then
+  error("[{mod_id}] cloth mesh {r.cloth_index} layout differs from the exported model")
+ end
+ resource.renderPositions = {_float3s(r.render_positions)}
+ resource.simulationPositions = {_float3s(r.simulation_positions)}
+ resource.fabric.restValues = {_flat(r.rest_values)}
+ resource.fabric.tetherLengths = {_flat(r.tether_lengths)}
+end""")
+    return "\n".join(blocks)
+
+
 def parameters_lua(parameters, target):
     """Statements setting the solver parameters (dict, keys from cloth.PARAMETER_NAMES) of cloth mesh `target`."""
     lines = [f" {target}.{name} = {_number(float(parameters[name]))}" for name in PARAMETER_NAMES if name in parameters]

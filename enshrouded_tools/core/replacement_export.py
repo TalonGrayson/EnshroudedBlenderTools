@@ -35,6 +35,8 @@ class ReplacementPayload:
     # Skinned export (KFC4): stream sits between vertexData and indexData.
     skinning_data_size: int = 0
     skinning_map: tuple[int, ...] = ()
+    # Extra Lua run after the topology patch, with `model` in scope (e.g. cloth_lua.reshape_lua).
+    extra_lua: str = ''
 
     @property
     def skinned(self) -> bool:
@@ -1054,6 +1056,7 @@ end
 
 model.renderData = game.guid.to_content_hash(content.guid)
 {topology_patch}
+{replacement.extra_lua}
 
 model.positionOffset.x = {_number(offset[0])}
 model.positionOffset.y = {_number(offset[1])}
