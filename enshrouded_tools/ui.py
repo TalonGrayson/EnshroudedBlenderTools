@@ -343,6 +343,20 @@ def _draw_export(layout, context, props, mode):
     if props.export_textures:
         layout.label(text="Uses external images and texconv.exe", icon="IMAGE_DATA")
         layout.label(text="Creates material copies for this model", icon="MATERIAL")
+        materials = []
+        if props.export_scope == "COLLECTION" and props.export_collection is not None and mode != "REPLACEMENT":
+            sources = [o for o in props.export_collection.all_objects if o.type == "MESH"]
+        else:
+            sources = [context.active_object] if context.active_object is not None else []
+        for source in sources:
+            for slot in getattr(source, "material_slots", ()):
+                if slot.material is not None and slot.material not in materials:
+                    materials.append(slot.material)
+        if materials:
+            box = layout.box()
+            box.label(text="Tint (game dye colours over albedo)", icon="COLOR")
+            for material in materials:
+                box.prop(material, "enshrouded_no_tint", text=f"No Tint: {material.name}")
     row = layout.row(align=True)
     row.prop(props, "export_directory")
     row.operator("enshrouded.use_default_export_folder", text="", icon="LOOP_BACK")

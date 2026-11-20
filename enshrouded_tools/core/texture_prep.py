@@ -15,6 +15,22 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 COLOR_SPACE_CHUNKS = frozenset({b"sRGB", b"gAMA", b"iCCP", b"cHRM"})
 
 
+# "No Tint": a tint layer mask that is black everywhere, so no tint layer applies and the albedo shows as painted.
+# Masks are sampled by UV, so a tiny texture works; BC4 stores one channel, and an all-zero 8-byte block decodes to 0.
+BLACK_MASK_SIZE = 4
+
+
+def black_bc4_chain(size: int = BLACK_MASK_SIZE) -> bytes:
+    """Full BC4 mip chain (size x size down to 1x1) of value 0."""
+    if size < 1 or size & (size - 1):
+        raise ValueError("mask size must be a power of two")
+    data = b""
+    for level in range(size.bit_length()):
+        width = max(1, size >> level)
+        data += bytes(8 * ((width + 3) // 4) ** 2)
+    return data
+
+
 def strip_png_color_space(data: bytes) -> bytes:
     """Return the PNG without colour-space chunks; pixel data is untouched."""
     if data[:8] != PNG_SIGNATURE:

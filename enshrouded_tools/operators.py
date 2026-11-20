@@ -323,6 +323,7 @@ def _collect_collider_patch_groups(model_obj, source_to_blender, collection=None
 
 _TEXCONV_FORMATS = {
     131: "BC1_UNORM",
+    139: "BC4_UNORM",
     141: "BC5_UNORM",
     143: "BC6H_UF16",
     146: "BC7_UNORM_SRGB",
@@ -423,8 +424,12 @@ def _compress_texture(texconv_path, image, texture):
     return raw
 
 
+_TINT_MASK_SLOT = re.compile(r"tintLayerMask_\d+_\d+$")
+
+
 def _collect_texture_patches(obj, reader, model, prefs):
     candidates = []
+    blank = []   # generated patches (black tint masks), no texconv needed
     for material_index, material_slot in enumerate(obj.material_slots):
         material = material_slot.material
         if material is None:
@@ -448,7 +453,27 @@ def _collect_texture_patches(obj, reader, model, prefs):
         parsed = parse_material(reader.read_resource(resource_index), archive_format=reader.format)
         textures_by_name = {texture.slot_name: texture for texture in parsed.textures}
         matched_images = 0
-        for slot_name in ("albedo_map_0", "normal_map_0", "material_map_0", "emissive_map_0"):
+        no_tint = bool(getattr(material, "enshrouded_no_tint", False))
+        if no_tint:
+            from .core.texture_prep import black_bc4_chain, BLACK_MASK_SIZE
+            masks = [t for t in parsed.textures if _TINT_MASK_SLOT.search(t.slot_name)]
+            if not masks:
+                raise ValueError(f"material {material.name}: 'No Tint' is on, but target material "
+                                 f"{parsed.debug_name} has no tint layer masks")
+            for texture in masks:
+                if texture.vk_format != 139:
+                    raise ValueError(f"{texture.slot_name}: tint mask format {texture.vk_format} is not BC4")
+                blank.append(TexturePatch(
+                    material_index=material_index, material_guid=material_guid,
+                    material_name=parsed.debug_name, slot_name=texture.slot_name,
+                    data=black_bc4_chain(BLACK_MASK_SIZE), width=BLACK_MASK_SIZE, height=BLACK_MASK_SIZE,
+                    mip_count=BLACK_MASK_SIZE.bit_length(), vk_format=139))
+            matched_images += len(masks)
+        # Every texture slot of the target material can be replaced: the four PBR maps and, e.g., the tint layer
+        # masks (node name = slot name, as the importer creates them).
+        for slot_name in textures_by_name:
+            if no_tint and _TINT_MASK_SLOT.search(slot_name):
+                continue
             texture_node = _texture_slot_node(material, slot_name)
             texture = textures_by_name.get(slot_name)
             if texture_node is None or texture_node.type != "TEX_IMAGE":
@@ -475,11 +500,11 @@ def _collect_texture_patches(obj, reader, model, prefs):
             )
 
     if not candidates:
-        return ()
+        return tuple(blank)
     texconv_path = Path(bpy.path.abspath(prefs.texconv_path)) if prefs.texconv_path else None
     if texconv_path is None or not texconv_path.is_file():
         raise ValueError("set a valid texconv.exe path in Add-on Preferences")
-    return tuple(
+    return tuple(blank) + tuple(
         TexturePatch(
             material_index=material_index,
             material_guid=material_guid,

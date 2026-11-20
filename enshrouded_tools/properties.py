@@ -444,8 +444,15 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.enshrouded = PointerProperty(type=ENSHROUDED_SceneProperties)
+    bpy.types.Material.enshrouded_no_tint = BoolProperty(
+        name="No Tint",
+        description=("Export black tint layer masks for this material, so the game's tint colours don't paint over "
+                     "the albedo (use for hand-painted textures). Needs Export Textures"),
+        default=False,
+    )
 
 def unregister():
+    del bpy.types.Material.enshrouded_no_tint
     del bpy.types.Scene.enshrouded
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
