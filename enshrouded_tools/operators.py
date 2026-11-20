@@ -21,6 +21,7 @@ from .core.collision import (
     parse_template_effects,
 )
 from .core.kfc3_reader import KFC3Reader
+from .core.known_formats import encode_snorm_10_10_10_2
 from .core.crafting import crafting_catalog
 from .core.skinning import read_skinning
 from .core.idle_audio import list_audio_donors
@@ -604,14 +605,15 @@ def _collect_effect_patches(collection, source_to_blender):
     return tuple(_effect_patch_from_object(obj, source_to_blender) for obj in objects)
 
 
-def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
+def _full_topology_records(export_mesh, object_to_source, source_vertices=None, triangle_filter=None):
     """Build one exported vertex per distinct face corner.
 
     Corners of the same mesh vertex with the same normal, tangent frame and UV
     share a record (all material ranges index one vertex buffer), so a smooth
     mesh exports about one vertex per Blender vertex instead of three per
     triangle. ``source_vertices``, if given, receives the mesh vertex index of
-    each record.
+    each record. ``triangle_filter(loop_triangle)``, if given, selects the
+    triangles to export (cloth parts are exported as separate ranges).
     """
     export_mesh.calc_loop_triangles()
     uv_layer = export_mesh.uv_layers.active
@@ -627,10 +629,13 @@ def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
     normal_matrix = direction_matrix.inverted_safe().transposed()
     handedness_flip = -1.0 if direction_matrix.determinant() < 0.0 else 1.0
     records = []
+    tangent_sums = []
     indices = []
     record_by_corner = {}
     triangles_by_material = {}
     for triangle in export_mesh.loop_triangles:
+        if triangle_filter is not None and not triangle_filter(triangle):
+            continue
         material_index = export_mesh.polygons[triangle.polygon_index].material_index
         triangles_by_material.setdefault(material_index, []).append(triangle)
     material_mesh_ranges = []
@@ -653,26 +658,31 @@ def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
                     game_uv = (float(uv.x), 1.0 - float(uv.y))
                 else:
                     game_uv = (0.0, 0.0)
+                # Compare corners by what the game stores (10-bit normal, half-float UV, handedness): Blender's
+                # custom normals come back with ~1e-4 noise per corner, and on flat-shaded faces (every imported
+                # model) Blender's tangents differ per face, so the tangent is averaged over the shared corners
+                # instead of splitting the vertex.
                 corner = (
                     loop.vertex_index,
-                    tuple(round(value, 6) for value in normal),
-                    tuple(round(value, 6) for value in tangent),
-                    bitangent_sign,
-                    tuple(round(value, 7) for value in game_uv),
+                    encode_snorm_10_10_10_2(normal, 1.0),
+                    bitangent_sign >= 0.0,
+                    struct.pack("<2e", *game_uv),
                 )
                 existing = record_by_corner.get(corner)
                 if existing is not None:
+                    tangent_sums[existing] += tangent
                     triangle_indices.append(existing)
                     continue
                 record_by_corner[corner] = len(records)
                 triangle_indices.append(len(records))
                 if source_vertices is not None:
                     source_vertices.append(loop.vertex_index)
+                tangent_sums.append(tangent.copy())
                 records.append(
                     (
                         tuple(position),
                         tuple(normal),
-                        tuple(tangent),
+                        None,
                         bitangent_sign,
                         game_uv,
                         b"\xff\xff\xff\xff",
@@ -687,7 +697,120 @@ def _full_topology_records(export_mesh, object_to_source, source_vertices=None):
 
     if has_tangents:
         export_mesh.free_tangents()
-    return tuple(records), tuple(indices), tuple(material_mesh_ranges)
+    finished = []
+    for record, tangent_sum in zip(records, tangent_sums):
+        normal = Vector(record[1])
+        tangent = tangent_sum - normal * normal.dot(tangent_sum)
+        if tangent.length < 1e-8:
+            tangent = Vector(_fallback_tangent(normal))
+        finished.append((record[0], record[1], tuple(tangent.normalized()), record[3], record[4], record[5]))
+    return tuple(finished), tuple(indices), tuple(material_mesh_ranges)
+
+
+CLOTH_GROUP = "enshrouded_cloth_{}"            # vertices of vanilla cloth part <k> (0-based)
+CLOTH_PIN_GROUP = "enshrouded_cloth_{}_pin"    # vertices of that part that stay attached
+CLOTH_WEIGHT_ATTRIBUTE = "enshrouded_cloth_weight"
+_CLOTH_GROUP_NAME = re.compile(r"enshrouded_cloth_(\d+)(_pin)?")
+
+
+def _cloth_membership(obj, mesh):
+    """({vertex: cloth part}, {vertex: cloth part} for pins) from the enshrouded_cloth_* vertex groups (weight >= 0.5)."""
+    part_of_group, pin_of_group = {}, {}
+    for group in obj.vertex_groups:
+        match = _CLOTH_GROUP_NAME.fullmatch(group.name)
+        if match:
+            (pin_of_group if match.group(2) else part_of_group)[group.index] = int(match.group(1))
+    members, pins = {}, {}
+    if not part_of_group:
+        return members, pins
+    for vertex in mesh.vertices:
+        for element in vertex.groups:
+            if element.weight < 0.5:
+                continue
+            if element.group in part_of_group:
+                members[vertex.index] = part_of_group[element.group]
+            elif element.group in pin_of_group:
+                pins[vertex.index] = pin_of_group[element.group]
+    return members, pins
+
+
+def _split_cloth_records(evaluated, mesh, transform, influences_out=None):
+    """Full-topology records for the static part and for every cloth part of one evaluated mesh.
+
+    A triangle belongs to cloth part k when all three corners are in the part's vertex group; every other triangle
+    is static. Returns (records, indices, ranges, parts) where parts maps cloth index ->
+    dict(records, indices, ranges, pinned, weights). Influences (when requested) are appended static first, then
+    the parts in cloth index order, matching the order the payload stores the records.
+    """
+    members, pins = _cloth_membership(evaluated, mesh)
+    mesh.calc_loop_triangles()
+
+    def part_of(triangle):
+        parts = {members.get(mesh.loops[loop].vertex_index) for loop in triangle.loops}
+        return parts.pop() if len(parts) == 1 else None
+
+    sources = []
+    records, indices, ranges = _full_topology_records(
+        mesh, transform, sources, (lambda t: part_of(t) is None) if members else None)
+    if influences_out is not None:
+        influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
+    parts = {}
+    weight_layer = mesh.attributes.get(CLOTH_WEIGHT_ATTRIBUTE)
+    for cloth_index in sorted(set(members.values())):
+        part_sources = []
+        part_records, part_indices, part_ranges = _full_topology_records(
+            mesh, transform, part_sources, lambda t, k=cloth_index: part_of(t) == k)
+        if not part_indices:
+            continue
+        if influences_out is not None:
+            influences_out.extend(_vertex_group_influences(evaluated, mesh, part_sources))
+        weights = ([float(weight_layer.data[v].value) for v in part_sources]
+                   if weight_layer is not None and weight_layer.domain == "POINT" else [])
+        parts[cloth_index] = dict(
+            records=part_records, indices=part_indices, ranges=part_ranges,
+            pinned=[pins.get(v) == cloth_index for v in part_sources], weights=weights,
+        )
+    return records, indices, ranges, parts
+
+
+def _fold_cloth_into_static(records, indices, ranges, cloth_parts):
+    """Append cloth parts to the static stream as ordinary material ranges (for targets without cloth)."""
+    records, indices, ranges = list(records), list(indices), list(ranges)
+    for cloth_index in sorted(cloth_parts):
+        part = cloth_parts[cloth_index]
+        base = len(records)
+        records.extend(part["records"])
+        ranges.append((part["material"], len(indices), len(part["indices"])))
+        indices.extend(base + i for i in part["indices"])
+    return tuple(records), tuple(indices), tuple(ranges)
+
+
+def _tag_cloth_vertices(obj, descriptor):
+    """Import: put each vanilla cloth part's vertices (and its pins) in vertex groups, and its per-vertex simulation
+    weight in a point attribute, so Full Topology export can rebuild the cloth after the mesh is edited."""
+    from .core.cloth import parse_cloth_data
+    from .core.cloth_reshape import cloth_vertex_ranges
+    cloth = parse_cloth_data(descriptor)
+    if cloth is None:
+        return 0
+    ranges = cloth_vertex_ranges(descriptor)
+    weights = obj.data.attributes.new(name=CLOTH_WEIGHT_ATTRIBUTE, type="FLOAT", domain="POINT")
+    for vertex in obj.data.vertices:
+        weights.data[vertex.index].value = 0.0
+    for cloth_index, (first, count) in sorted(ranges.items()):
+        mesh = cloth.meshes[cloth_index]
+        mapping = mesh.arrays["renderSimulationVertexIndices"]
+        inverse_masses = mesh.arrays["simulationInvMasses"]
+        vertex_weights = mesh.arrays["simulationVertexWeights"]
+        vertices = range(first, first + count)
+        obj.vertex_groups.new(name=CLOTH_GROUP.format(cloth_index)).add(list(vertices), 1.0, "REPLACE")
+        pinned = [first + i for i in range(count) if inverse_masses[mapping[i]] == 0]
+        obj.vertex_groups.new(name=CLOTH_PIN_GROUP.format(cloth_index)).add(pinned, 1.0, "REPLACE")
+        for i in range(count):
+            if mapping[i] < len(vertex_weights):
+                weights.data[first + i].value = vertex_weights[mapping[i]]
+    obj["enshrouded_cloth_parts"] = len(ranges)
+    return len(ranges)
 
 
 def _load_texture_image(reader, texture, material_name):
@@ -897,6 +1020,7 @@ class ENSHROUDED_OT_import_model(Operator):
                     )
                 resource_index = lookup.resource_index
                 descriptor = reader.read_resource(resource_index)
+                archive_format = reader.format
                 model = parse_render_model(descriptor, archive_format=reader.format)
                 content_index, render_data = reader.read_content(model.render_data_hash)
                 skinning = None
@@ -1000,6 +1124,11 @@ class ENSHROUDED_OT_import_model(Operator):
                 obj["enshrouded_forward_axis"] = "-Z"
                 obj["enshrouded_up_axis"] = "+Y"
                 obj["enshrouded_vertex_frame_format"] = "A2B10G10R10_SNORM"
+                if archive_format == "KFC4":
+                    try:
+                        _tag_cloth_vertices(obj, descriptor)
+                    except (ValueError, KeyError, IndexError, struct.error) as exc:
+                        self.report({'WARNING'}, f'Cloth vertex groups skipped: {exc}')
                 imported.append(obj)
 
             imported_colliders = _import_template_collider_groups(
@@ -1358,13 +1487,23 @@ def _vertex_group_influences(obj, mesh, source_vertices):
     return result
 
 
-def _object_export_records(context, obj, export_mode, influences_out=None):
+def _object_export_records(context, obj, export_mode, influences_out=None, cloth_out=None):
+    """cloth_out (dict), when given, receives {cloth index: part} for Full Topology cloth parts; their influences
+    follow the static ones in influences_out."""
     depsgraph = context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
     try:
         transform = _source_to_blender_matrix().inverted() @ evaluated.matrix_world
         if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
+            if cloth_out is not None:
+                records, indices, ranges, parts = _split_cloth_records(evaluated, mesh, transform, influences_out)
+                for cloth_index, part in parts.items():
+                    if len({material for material, _o, _c in part["ranges"]}) != 1:
+                        raise ValueError(f"cloth part {cloth_index} uses several materials; give it one material")
+                    part["material"] = part["ranges"][0][0]
+                cloth_out.update(parts)
+                return None, records, indices, ranges
             sources = [] if influences_out is not None else None
             records, indices, ranges = _full_topology_records(mesh, transform, sources)
             if influences_out is not None:
@@ -1375,9 +1514,12 @@ def _object_export_records(context, obj, export_mode, influences_out=None):
         evaluated.to_mesh_clear()
 
 
-def _collection_export_records(context, collection, influences_out=None):
+def _collection_export_records(context, collection, influences_out=None, cloth_out=None):
+    """cloth_out (dict), when given, receives the cloth parts of all objects merged per cloth index; influences_out
+    then holds every static record's influences followed by each part's, in cloth index order."""
     from types import SimpleNamespace
     records, buckets, materials = [], {}, []
+    cloth_influences = {}
     depsgraph = context.evaluated_depsgraph_get()
     transform = _source_to_blender_matrix().inverted()
     objects = sorted((obj for obj in collection.all_objects
@@ -1385,24 +1527,58 @@ def _collection_export_records(context, collection, influences_out=None):
                      key=lambda obj: obj.name)
     if not objects:
         raise ValueError("Collection contains no exportable meshes")
+
+    def global_slot(mesh, local_slot):
+        material = mesh.materials[local_slot] if local_slot < len(mesh.materials) else None
+        if material not in materials:
+            materials.append(material)
+        return materials.index(material)
+
     for obj in objects:
         evaluated = obj.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
-            sources = [] if influences_out is not None else None
-            vertices, indices, ranges = _full_topology_records(mesh, transform @ evaluated.matrix_world, sources)
-            if influences_out is not None:
-                influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
+            object_transform = transform @ evaluated.matrix_world
+            if cloth_out is not None:
+                object_influences = [] if influences_out is not None else None
+                vertices, indices, ranges, parts = _split_cloth_records(
+                    evaluated, mesh, object_transform, object_influences)
+                if influences_out is not None:
+                    influences_out.extend(object_influences[:len(vertices)])
+                    cursor = len(vertices)
+                    for cloth_index, part in sorted(parts.items()):
+                        count = len(part["records"])
+                        cloth_influences.setdefault(cloth_index, []).extend(object_influences[cursor:cursor + count])
+                        cursor += count
+                for cloth_index, part in sorted(parts.items()):
+                    slots = {global_slot(mesh, local) for local, _o, _c in part["ranges"]}
+                    merged = cloth_out.setdefault(cloth_index, dict(records=[], indices=[], pinned=[], weights=[],
+                                                                    materials=set()))
+                    base = len(merged["records"])
+                    merged["records"].extend(part["records"])
+                    merged["indices"].extend(base + i for i in part["indices"])
+                    merged["pinned"].extend(part["pinned"])
+                    merged["weights"].extend(part["weights"] or [1.0] * len(part["records"]))
+                    merged["materials"] |= slots
+            else:
+                sources = [] if influences_out is not None else None
+                vertices, indices, ranges = _full_topology_records(mesh, object_transform, sources)
+                if influences_out is not None:
+                    influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
             base = len(records)
             records.extend(vertices)
             for local_slot, start, count in ranges:
-                material = mesh.materials[local_slot] if local_slot < len(mesh.materials) else None
-                if material not in materials:
-                    materials.append(material)
-                slot = materials.index(material)
+                slot = global_slot(mesh, local_slot)
                 buckets.setdefault(slot, []).extend(base + index for index in indices[start:start + count])
         finally:
             evaluated.to_mesh_clear()
+    if cloth_out:
+        for cloth_index, part in sorted(cloth_out.items()):
+            if len(part["materials"]) != 1:
+                raise ValueError(f"cloth part {cloth_index} uses several materials; give it one material")
+            part["material"] = next(iter(part["materials"]))
+            if influences_out is not None:
+                influences_out.extend(cloth_influences.get(cloth_index, []))
     indices, ranges = [], []
     for slot, bucket in sorted(buckets.items()):
         ranges.append((slot, len(indices), len(bucket)))
@@ -1522,10 +1698,11 @@ class ENSHROUDED_OT_export_replacement(Operator):
         skin_influences = (
             [] if export_mode == "FULL_REPLACEMENT" and props.export_skin_weights else None
         )
+        cloth_parts = {} if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"} else None
         if collection is not None:
             try:
                 vertex_records, indices, material_mesh_ranges, texture_source = _collection_export_records(
-                    context, collection, skin_influences)
+                    context, collection, skin_influences, cloth_parts)
                 positions = None
             except Exception as exc:
                 self.report({"ERROR"}, f"Collection export failed: {exc}")
@@ -1533,7 +1710,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         else:
             try:
                 positions, vertex_records, indices, material_mesh_ranges = _object_export_records(
-                    context, obj, export_mode, skin_influences)
+                    context, obj, export_mode, skin_influences, cloth_parts)
             except Exception as exc:
                 self.report({"ERROR"}, f"Mesh export failed: {exc}")
                 return {"CANCELLED"}
@@ -1542,7 +1719,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
             return self._write_export(context, props, obj, export_mode, source_guid, target_guid,
                 kfc, resources, collider_groups, texture_source, positions, vertex_records,
                 indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches,
-                skin_influences)
+                skin_influences, cloth_parts)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1589,7 +1766,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
     def _write_export(self, context, props, obj, export_mode, source_guid, target_guid,
                       kfc, resources, collider_groups, texture_source, positions, vertex_records,
                       indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches,
-                      skin_influences=None):
+                      skin_influences=None, cloth_parts=None):
 
         cloth_note = ""
         try:
@@ -1645,13 +1822,58 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     if props.export_textures else ()
                 )
             if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
+                from .core.cloth import parse_cloth_data
+                target_cloth = parse_cloth_data(descriptor) if archive_format == 'KFC4' else None
+                cloth_order = sorted(cloth_parts) if cloth_parts else []
+                if cloth_order and target_cloth is None:
+                    self.report({'WARNING'}, 'Cloth vertex groups ignored: the target model has no cloth '
+                                             '(the cloth parts export as static mesh)')
+                    vertex_records, indices, material_mesh_ranges = _fold_cloth_into_static(
+                        vertex_records, indices, material_mesh_ranges, cloth_parts)
+                    cloth_order = []
+                elif target_cloth is not None and not cloth_order:
+                    self.report({'WARNING'}, 'Target model has cloth but the mesh has no enshrouded_cloth_* vertex '
+                                             'groups (import the model with this add-on); cloth exports as static mesh')
+                if cloth_order:
+                    missing = [k for k in cloth_order if k >= len(target_cloth.meshes)]
+                    if missing:
+                        raise ValueError(f"cloth part(s) {missing} don't exist in the target model "
+                                         f"({len(target_cloth.meshes)} cloth part(s))")
+                    if target_cloth.has_skinning and skinning is None:
+                        raise ValueError('The target cloth follows bones: turn on "Export Bone Weights"')
                 replacement = build_full_topology_payload(
                     vertex_records, indices, material_mesh_ranges, archive_format=archive_format,
                     skinning=skinning,
+                    cloth_segments=[(cloth_parts[k]["material"], cloth_parts[k]["records"], cloth_parts[k]["indices"])
+                                    for k in cloth_order],
                 )
-                if len(replacement.material_mesh_ranges) > len(model.meshes):
+                if cloth_order:
+                    from .core.cloth_export import ClothPartInput, build_cloth_part
+                    from .core.cloth_lua import full_cloth_lua
+                    cursor = len(vertex_records)
+                    built = []
+                    for k in cloth_order:
+                        part = cloth_parts[k]
+                        count = len(part["records"])
+                        skin_records = None
+                        if skinning is not None:
+                            skin_records = [skinning.data[(cursor + i) * 8:(cursor + i) * 8 + 8] for i in range(count)]
+                        cursor += count
+                        built.append(build_cloth_part(ClothPartInput(
+                            cloth_index=k, material=part["material"],
+                            positions=[record[0] for record in part["records"]],
+                            uvs=[record[4] for record in part["records"]],
+                            triangles=[tuple(part["indices"][i:i + 3]) for i in range(0, len(part["indices"]), 3)],
+                            pinned=part["pinned"], weights=part["weights"],
+                        ), target_cloth.meshes[k], skin_records, skinning.skinning_map if skinning else ()))
+                    replacement = dataclasses.replace(replacement, extra_lua=full_cloth_lua(built, mod_id))
+                    cloth_note = (f"{len(built)} cloth part(s) rebuilt ("
+                                  + ", ".join(f"{len(b.render_positions)} vertices / {len(b.cooked.positions)} "
+                                              f"particles / {sum(b.cooked.inv_masses[i] == 0 for i in range(len(b.cooked.positions)))} pinned"
+                                              for b in built) + ")")
+                if len(replacement.material_mesh_ranges) + len(replacement.cloth_meshes) > len(model.meshes):
                     raise ValueError(
-                        "target RenderModel has fewer reusable mesh entries than Blender materials"
+                        "target RenderModel has fewer reusable mesh entries than Blender materials and cloth parts"
                     )
                 highest_material = max(
                     material for material, _offset, _count
@@ -1673,11 +1895,6 @@ class ENSHROUDED_OT_export_replacement(Operator):
                             replacement, extra_lua=reshape_lua(reshaped, mod_id))
                         cloth_note = (f"{len(reshaped)} cloth part(s) kept, cloth vertices moved up to "
                                       f"{max(r.max_render_move for r in reshaped):.3f} m")
-            if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"} and archive_format == 'KFC4':
-                from .core.cloth import cloth_offset
-                if cloth_offset(descriptor):
-                    self.report({'WARNING'}, 'Target model has cloth; Full Replacement does not keep cloth '
-                                             'simulation yet (the cloth parts export as static mesh)')
             model_name = model.debug_name
         except Exception as exc:
             self.report({"ERROR"}, f"Replacement build failed: {exc}")

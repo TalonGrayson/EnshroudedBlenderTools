@@ -37,6 +37,13 @@ class ReplacementPayload:
     skinning_map: tuple[int, ...] = ()
     # Extra Lua run after the topology patch, with `model` in scope (e.g. cloth_lua.reshape_lua).
     extra_lua: str = ''
+    # Full topology cloth parts: (material, first vertex, vertex count, index offset, index count) per cloth mesh,
+    # in clothMeshIndex order (part i -> clothMeshIndex i + 1). Their vertices follow the main vertices.
+    cloth_meshes: tuple[tuple[int, int, int, int, int], ...] = ()
+
+    @property
+    def main_vertex_count(self) -> int:
+        return self.vertex_count - sum(mesh[2] for mesh in self.cloth_meshes)
 
     @property
     def skinned(self) -> bool:
@@ -154,16 +161,34 @@ def build_replacement_payload(model, original_data: bytes, positions) -> Replace
 
 
 def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=(), *, archive_format='KFC3',
-                                skinning=None) -> ReplacementPayload:
+                                skinning=None, cloth_segments=()) -> ReplacementPayload:
     """Build a complete 24-byte vertex stream plus uint16 index stream.
 
     Each record is ``(position, normal, tangent, bitangent_sign, uv, color)``.
     UV is already in Keen convention and color is four raw RGBA bytes.
     ``skinning`` is an optional ``skin_export.SkinningStream`` (KFC4 only),
-    written between the vertex and index data like vanilla skinned models.
+    written between the vertex and index data like vanilla skinned models; it covers the main records followed by
+    every cloth segment's records.
+    ``cloth_segments`` (KFC4 only): ``(material, records, local indices)`` per cloth part. Each becomes its own vertex
+    range after the main vertices (its own planar block) with indices local to that range, like vanilla cloth meshes.
     """
     records = tuple(vertex_records)
     indices = tuple(int(index) for index in indices)
+    main_records = len(records)
+    main_indices = len(indices)
+    cloth_meshes = []
+    if cloth_segments and archive_format != 'KFC4':
+        raise ValueError('cloth export is only supported for KFC4 archives')
+    for material, segment_records, segment_indices in cloth_segments:
+        segment_records = tuple(segment_records)
+        segment_indices = tuple(int(i) for i in segment_indices)
+        if not segment_records or not segment_indices or len(segment_indices) % 3:
+            raise ValueError('cloth part has no triangles')
+        if max(segment_indices) >= len(segment_records) or min(segment_indices) < 0:
+            raise ValueError('cloth part index references a missing vertex')
+        cloth_meshes.append((int(material), len(records), len(segment_records), len(indices), len(segment_indices)))
+        records += segment_records
+        indices += segment_indices
     if not records or not indices:
         raise ValueError("full topology export requires vertices and triangle indices")
     if len(indices) % 3:
@@ -177,11 +202,11 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         for material, offset, count in material_mesh_ranges
     )
     if not material_mesh_ranges:
-        material_mesh_ranges = ((0, 0, len(indices)),)
-    if any(offset < 0 or count <= 0 or offset + count > len(indices)
+        material_mesh_ranges = ((0, 0, main_indices),)
+    if any(offset < 0 or count <= 0 or offset + count > main_indices
            for _material, offset, count in material_mesh_ranges):
         raise ValueError("material mesh range exceeds generated index data")
-    if sum(count for _material, _offset, count in material_mesh_ranges) != len(indices):
+    if sum(count for _material, _offset, count in material_mesh_ranges) != main_indices:
         raise ValueError("material mesh ranges do not cover all generated indices")
     cursor = 0
     for material, start, count in material_mesh_ranges:
@@ -217,9 +242,12 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
             raise ValueError('skinning stream does not match the exported vertex count')
         skin_data = skinning.data
     if archive_format == 'KFC4':
+        # Planar per vertex range (main, then each cloth part): P, N, T, C, UV planes of that range.
+        segments = [(0, main_records)] + [(first, count) for _m, first, count, _io, _ic in cloth_meshes]
         vertices = b''.join(vertices[i*24+offset:i*24+offset+size]
+                            for first, count in segments
                             for offset, size in ((0,8),(8,4),(12,4),(16,4),(20,4))
-                            for i in range(len(records)))
+                            for i in range(first, first + count))
         index_data += bytes((-(len(vertices) + len(skin_data) + len(index_data))) % 16)
     elif archive_format != 'KFC3':
         raise ValueError('Unsupported export archive format')
@@ -242,6 +270,7 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         archive_format=archive_format,
         skinning_data_size=len(skin_data),
         skinning_map=tuple(skinning.skinning_map) if skinning is not None else (),
+        cloth_meshes=tuple(cloth_meshes),
     )
 
 

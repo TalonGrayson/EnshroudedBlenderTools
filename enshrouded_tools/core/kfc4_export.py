@@ -4,28 +4,37 @@ from .material import _BLOCK_BYTES
 
 def topology_lua(payload, mod_id):
     ranges = payload.material_mesh_ranges
-    lines = [f'''if #model.meshes < {len(ranges)} or #model.lods < 1 then
+    cloth = getattr(payload, 'cloth_meshes', ())
+    main_vertices = payload.vertex_count - sum(c[2] for c in cloth)
+    # Main material ranges share the first vertex range; each cloth part has its own range (vertexDataByteOffset =
+    # first vertex * 24, skinVertexOffset = first vertex) and clothMeshIndex = its position in model.cloth.meshes
+    # (1-based), like vanilla cloth meshes.
+    meshes = [(material, offset, count, 0, main_vertices, 0) for material, offset, count in ranges]
+    meshes += [(material, index_offset, index_count, first, vertex_count, k)
+               for k, (material, first, vertex_count, index_offset, index_count) in enumerate(cloth, 1)]
+    used_materials = [m[0] for m in meshes]
+    lines = [f'''if #model.meshes < {len(meshes)} or #model.lods < 1 then
  error("[{mod_id}] base has insufficient reusable meshes/LODs")
 end
-if #model.materials < {max(m for m, _, _ in ranges)+1} then error("Missing material slots") end
+if #model.materials < {max(used_materials)+1} then error("Missing material slots") end
 local exported_meshes = {{}}
 ''']
-    for i, (material, offset, count) in enumerate(ranges, 1):
+    for i, (material, offset, count, first, vertex_count, cloth_index) in enumerate(meshes, 1):
         lines.append(f'''do
  local mesh = model.meshes[{i}]
  mesh.materialIndex = {material}
- mesh.vertexCount = {payload.vertex_count}
+ mesh.vertexCount = {vertex_count}
  mesh.indexOffset = {offset}
  mesh.indexCount = {count}
- mesh.vertexDataByteOffset = 0
+ mesh.vertexDataByteOffset = {first * 24}
  mesh.meshletOffset = 0
  mesh.meshletCount = 0
  mesh.blendShapeByteOffset = 0
- mesh.skinVertexOffset = 0
+ mesh.skinVertexOffset = {first}
  mesh.vertexFormat = "PNTCT"
  mesh.vertexStride = 24
  mesh.positionQuantization = "x21y21z21_unorm"
- mesh.clothMeshIndex = 0
+ mesh.clothMeshIndex = {cloth_index}
  table.insert(exported_meshes, mesh)
 end
 ''')
@@ -58,7 +67,7 @@ model.blendShapes = {{}}
 model.blendShapeMask = 0
 for _, lod in ipairs(model.lods) do
  lod.meshOffset = 0
- lod.meshCount = {len(ranges)}
+ lod.meshCount = {len(meshes)}
 end
 ''')
     return '\n'.join(lines)

@@ -19,6 +19,7 @@ A mesh's RenderModelMesh.clothMeshIndex byte (mesh record +54) is 1-based: 0 = n
 """
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass, field
 
@@ -109,6 +110,27 @@ def parse_cloth_mesh(payload: bytes, offset: int) -> ClothMesh:
         cursor += 8
     parameters = dict(zip(PARAMETER_NAMES, struct.unpack_from("<17f", payload, cursor)))
     return ClothMesh(fabric, arrays, parameters)
+
+
+def free_inverse_mass(mesh: ClothMesh) -> float:
+    """The inverse mass vanilla gives every free particle (0 is reserved for pins)."""
+    free = sorted({m for m in mesh.arrays["simulationInvMasses"] if m > 0})
+    return free[0] if free else 1.0
+
+
+def tether_mode(mesh: ClothMesh) -> str:
+    """"euclidean" when every vanilla tether is the straight-line distance to the nearest pin (DLC banners),
+    otherwise "geodesic" (capes: anchors measured along the mesh)."""
+    positions = mesh.arrays["simulationPositions"]
+    pins = [i for i, m in enumerate(mesh.arrays["simulationInvMasses"]) if m == 0]
+    lengths = mesh.fabric.tetherLengths
+    if not pins or not lengths:
+        return "geodesic"
+    for i in range(min(len(lengths), len(positions))):
+        nearest = min(math.dist(positions[i], positions[p]) for p in pins)
+        if abs(lengths[i] - nearest) > 1e-4 * max(1.0, nearest):
+            return "geodesic"
+    return "euclidean"
 
 
 def parse_cloth_data(payload: bytes):
