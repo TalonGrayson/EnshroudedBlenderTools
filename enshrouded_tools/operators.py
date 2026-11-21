@@ -1555,6 +1555,9 @@ def _collection_export_records(context, collection, influences_out=None, cloth_o
 
     def global_slot(mesh, local_slot):
         material = mesh.materials[local_slot] if local_slot < len(mesh.materials) else None
+        # The evaluated mesh holds evaluated material copies, whose custom properties (No Tint, the GUID) can lag
+        # behind a value set from a script until the depsgraph updates; read the original material instead.
+        material = getattr(material, "original", material)
         if material not in materials:
             materials.append(material)
         return materials.index(material)
@@ -1575,6 +1578,20 @@ def _collection_export_records(context, collection, influences_out=None, cloth_o
                         count = len(part["records"])
                         cloth_influences.setdefault(cloth_index, []).extend(object_influences[cursor:cursor + count])
                         cursor += count
+            else:
+                parts = {}
+                sources = [] if influences_out is not None else None
+                vertices, indices, ranges = _full_topology_records(mesh, object_transform, sources)
+                if influences_out is not None:
+                    influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
+            # Static ranges claim material slots before cloth parts, so slot order follows the mesh's own slots
+            # (body first) rather than putting a cape's material at slot 0.
+            base = len(records)
+            records.extend(vertices)
+            for local_slot, start, count in ranges:
+                slot = global_slot(mesh, local_slot)
+                buckets.setdefault(slot, []).extend(base + index for index in indices[start:start + count])
+            if cloth_out is not None:
                 for cloth_index, part in sorted(parts.items()):
                     slots = {global_slot(mesh, local) for local, _o, _c in part["ranges"]}
                     merged = cloth_out.setdefault(cloth_index, dict(records=[], indices=[], pinned=[], weights=[],
@@ -1585,16 +1602,6 @@ def _collection_export_records(context, collection, influences_out=None, cloth_o
                     merged["pinned"].extend(part["pinned"])
                     merged["weights"].extend(part["weights"] or [1.0] * len(part["records"]))
                     merged["materials"] |= slots
-            else:
-                sources = [] if influences_out is not None else None
-                vertices, indices, ranges = _full_topology_records(mesh, object_transform, sources)
-                if influences_out is not None:
-                    influences_out.extend(_vertex_group_influences(evaluated, mesh, sources))
-            base = len(records)
-            records.extend(vertices)
-            for local_slot, start, count in ranges:
-                slot = global_slot(mesh, local_slot)
-                buckets.setdefault(slot, []).extend(base + index for index in indices[start:start + count])
         finally:
             evaluated.to_mesh_clear()
     if cloth_out:
